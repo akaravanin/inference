@@ -4,6 +4,7 @@ use axum::Router;
 use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tower_http::cors::CorsLayer;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -19,6 +20,44 @@ struct TokenChunk {
     done: bool,
 }
 
+#[derive(SimpleObject, Deserialize)]
+struct ModelInfo {
+    model_id: String,
+    device: String,
+    vram_used: String,
+    active_adapter: Option<String>,
+    load_in_4bit: bool,
+}
+
+#[derive(SimpleObject, Deserialize)]
+struct AdaptersInfo {
+    available: Vec<String>,
+    active: Option<String>,
+}
+
+#[derive(SimpleObject, Deserialize)]
+struct FineTuneStatus {
+    running: bool,
+    step: i32,
+    total_steps: i32,
+    loss: Option<f64>,
+    error: Option<String>,
+    completed_adapter: Option<String>,
+}
+
+#[derive(SimpleObject, Deserialize)]
+struct AdapterResult {
+    ok: bool,
+    error: Option<String>,
+    active_adapter: Option<String>,
+}
+
+#[derive(SimpleObject, Deserialize)]
+struct StartFineTuneResult {
+    ok: bool,
+    error: Option<String>,
+}
+
 #[derive(Serialize)]
 struct WorkerRequest {
     prompt: String,
@@ -28,6 +67,22 @@ struct WorkerRequest {
 #[derive(Deserialize)]
 struct WorkerResponse {
     text: String,
+}
+
+#[derive(Serialize)]
+struct FineTuneRequest {
+    adapter_name: String,
+    dataset_name: String,
+    num_samples: i32,
+    num_epochs: i32,
+    learning_rate: f64,
+    lora_r: i32,
+    lora_alpha: i32,
+}
+
+#[derive(Serialize)]
+struct LoadAdapterRequest {
+    adapter_name: String,
 }
 
 fn worker_url() -> String {
@@ -43,9 +98,42 @@ impl QueryRoot {
     async fn health(&self) -> &str {
         "ok"
     }
+
+    async fn adapters(&self, ctx: &Context<'_>) -> async_graphql::Result<AdaptersInfo> {
+        let client = ctx.data::<Client>()?;
+        let info = client
+            .get(format!("{}/adapters", worker_url()))
+            .send()
+            .await?
+            .json::<AdaptersInfo>()
+            .await?;
+        Ok(info)
+    }
+
+    async fn model_info(&self, ctx: &Context<'_>) -> async_graphql::Result<ModelInfo> {
+        let client = ctx.data::<Client>()?;
+        let info = client
+            .get(format!("{}/model-info", worker_url()))
+            .send()
+            .await?
+            .json::<ModelInfo>()
+            .await?;
+        Ok(info)
+    }
+
+    async fn fine_tune_status(&self, ctx: &Context<'_>) -> async_graphql::Result<FineTuneStatus> {
+        let client = ctx.data::<Client>()?;
+        let status = client
+            .get(format!("{}/fine-tune/status", worker_url()))
+            .send()
+            .await?
+            .json::<FineTuneStatus>()
+            .await?;
+        Ok(status)
+    }
 }
 
-// ── Mutation (non-streaming, kept for GraphQL Explorer) ───────────────────────
+// ── Mutation ──────────────────────────────────────────────────────────────────
 
 struct MutationRoot;
 
@@ -66,6 +154,71 @@ impl MutationRoot {
             .json()
             .await?;
         Ok(InferenceResult { text: resp.text })
+    }
+
+    async fn start_fine_tune(
+        &self,
+        ctx: &Context<'_>,
+        adapter_name: Option<String>,
+        dataset_name: Option<String>,
+        num_samples: Option<i32>,
+        num_epochs: Option<i32>,
+        learning_rate: Option<f64>,
+        lora_r: Option<i32>,
+        lora_alpha: Option<i32>,
+    ) -> async_graphql::Result<StartFineTuneResult> {
+        let client = ctx.data::<Client>()?;
+        let body = FineTuneRequest {
+            adapter_name: adapter_name.unwrap_or_else(|| "my-lora".to_string()),
+            dataset_name: dataset_name.unwrap_or_else(|| "tatsu-lab/alpaca".to_string()),
+            num_samples: num_samples.unwrap_or(500),
+            num_epochs: num_epochs.unwrap_or(1),
+            learning_rate: learning_rate.unwrap_or(2e-4),
+            lora_r: lora_r.unwrap_or(8),
+            lora_alpha: lora_alpha.unwrap_or(16),
+        };
+        let result = client
+            .post(format!("{}/fine-tune", worker_url()))
+            .json(&body)
+            .send()
+            .await?
+            .json::<StartFineTuneResult>()
+            .await?;
+        Ok(result)
+    }
+
+    async fn load_adapter(
+        &self,
+        ctx: &Context<'_>,
+        adapter_name: String,
+    ) -> async_graphql::Result<AdapterResult> {
+        let client = ctx.data::<Client>()?;
+        let result = client
+            .post(format!("{}/fine-tune/load", worker_url()))
+            .json(&LoadAdapterRequest { adapter_name })
+            .send()
+            .await?
+            .json::<AdapterResult>()
+            .await?;
+        Ok(result)
+    }
+
+    async fn use_base_model(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<AdapterResult> {
+        let client = ctx.data::<Client>()?;
+        let result = client
+            .post(format!("{}/fine-tune/unload", worker_url()))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        Ok(AdapterResult {
+            ok: result["ok"].as_bool().unwrap_or(false),
+            error: None,
+            active_adapter: None,
+        })
     }
 }
 
