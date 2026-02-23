@@ -1,8 +1,11 @@
+import json
 import os
+import threading
 import torch
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer
 from ddgs import DDGS
 
 app = FastAPI()
@@ -65,6 +68,30 @@ def search_web(query: str, max_results: int = 4) -> str:
         print(f"[search] error: {e}")
         return ""
 
+def build_messages(prompt: str, web_search: bool) -> list:
+    if web_search:
+        search_results = search_web(prompt)
+        if search_results:
+            print(f"[infer] injecting search context ({len(search_results)} chars)")
+            return [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant. "
+                        "The user's question has been looked up on the web RIGHT NOW and the results are below. "
+                        "Your knowledge cutoff is outdated — IGNORE IT and answer ONLY using the search results provided. "
+                        "Do not say you don't know or reference your training cutoff.\n\n"
+                        "=== LIVE WEB SEARCH RESULTS ===\n"
+                        f"{search_results}\n"
+                        "=== END OF SEARCH RESULTS ===\n\n"
+                        "Answer the user's question based on the above results. Cite the URL sources."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+        print("[infer] search returned nothing, falling back to plain prompt")
+    return [{"role": "user", "content": prompt}]
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 class InferRequest(BaseModel):
@@ -86,35 +113,8 @@ def health():
 
 @app.post("/infer", response_model=InferResponse)
 def infer(req: InferRequest) -> InferResponse:
-    if req.web_search:
-        search_results = search_web(req.prompt)
-        if search_results:
-            print(f"[infer] injecting search context ({len(search_results)} chars)")
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant. "
-                        "The user's question has been looked up on the web RIGHT NOW and the results are below. "
-                        "Your knowledge cutoff is outdated — IGNORE IT and answer ONLY using the search results provided. "
-                        "Do not say you don't know or reference your training cutoff.\n\n"
-                        "=== LIVE WEB SEARCH RESULTS ===\n"
-                        f"{search_results}\n"
-                        "=== END OF SEARCH RESULTS ===\n\n"
-                        "Answer the user's question based on the above results. Cite the URL sources."
-                    ),
-                },
-                {"role": "user", "content": req.prompt},
-            ]
-        else:
-            print("[infer] search returned nothing, falling back to plain prompt")
-            messages = [{"role": "user", "content": req.prompt}]
-    else:
-        messages = [{"role": "user", "content": req.prompt}]
-
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    messages = build_messages(req.prompt, req.web_search)
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
     with torch.no_grad():
@@ -127,5 +127,33 @@ def infer(req: InferRequest) -> InferResponse:
         )
 
     generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-    result = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return InferResponse(text=result)
+    return InferResponse(text=tokenizer.decode(generated_ids, skip_special_tokens=True))
+
+
+@app.post("/stream")
+def stream(req: InferRequest) -> StreamingResponse:
+    messages = build_messages(req.prompt, req.web_search)
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    thread = threading.Thread(
+        target=model.generate,
+        kwargs={
+            **inputs,
+            "max_new_tokens": req.max_new_tokens,
+            "temperature": req.temperature,
+            "do_sample": req.temperature > 0,
+            "pad_token_id": tokenizer.eos_token_id,
+            "streamer": streamer,
+        },
+    )
+    thread.start()
+
+    def sse():
+        for token in streamer:
+            yield f"data: {json.dumps({'token': token})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream")

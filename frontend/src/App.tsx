@@ -1,13 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
-import { useMutation, gql } from '@apollo/client'
+import { useApolloClient, gql } from '@apollo/client'
 import { GraphiQL } from 'graphiql'
 import { createGraphiQLFetcher } from '@graphiql/toolkit'
 import 'graphiql/graphiql.css'
 
-const INFER = gql`
-  mutation Infer($prompt: String!, $webSearch: Boolean) {
-    infer(prompt: $prompt, webSearch: $webSearch) {
-      text
+const INFER_STREAM = gql`
+  subscription InferStream($prompt: String!, $webSearch: Boolean) {
+    inferStream(prompt: $prompt, webSearch: $webSearch) {
+      token
+      done
     }
   }
 `
@@ -15,34 +16,69 @@ const INFER = gql`
 type Tab = 'chat' | 'explorer'
 type Message = { role: 'user' | 'assistant'; text: string; error?: boolean; searched?: boolean }
 
-const GQL_URL = import.meta.env.VITE_GRAPHQL_URL || 'http://localhost:8080/graphql'
-const fetcher = createGraphiQLFetcher({ url: GQL_URL })
+const GQL_HTTP = import.meta.env.VITE_GRAPHQL_URL    || 'http://localhost:8080/graphql'
+const GQL_WS   = import.meta.env.VITE_GRAPHQL_WS_URL || 'ws://localhost:8080/graphql/ws'
+const fetcher  = createGraphiQLFetcher({ url: GQL_HTTP, subscriptionUrl: GQL_WS })
 
 // ── Chat tab ──────────────────────────────────────────────────────────────────
 
 function ChatTab() {
-  const [prompt, setPrompt] = useState('')
+  const [prompt, setPrompt]   = useState('')
   const [messages, setMessages] = useState<Message[]>([])
   const [webSearch, setWebSearch] = useState(false)
-  const [infer, { loading }] = useMutation(INFER)
+  const [loading, setLoading]   = useState(false)
+  const client    = useApolloClient()
   const bottomRef = useRef<HTMLDivElement>(null)
+  const subRef    = useRef<{ unsubscribe(): void } | null>(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
 
-  const send = async () => {
+  // Clean up any active subscription on unmount
+  useEffect(() => () => { subRef.current?.unsubscribe() }, [])
+
+  const send = () => {
     if (!prompt.trim() || loading) return
-    const userText = prompt
+    const userText  = prompt
     const didSearch = webSearch
-    setMessages(m => [...m, { role: 'user', text: userText, searched: didSearch }])
+    setMessages(m => [
+      ...m,
+      { role: 'user',      text: userText, searched: didSearch },
+      { role: 'assistant', text: '' },
+    ])
     setPrompt('')
-    try {
-      const { data } = await infer({ variables: { prompt: userText, webSearch: didSearch } })
-      setMessages(m => [...m, { role: 'assistant', text: data.infer.text }])
-    } catch (err) {
-      setMessages(m => [...m, { role: 'assistant', text: `Error: ${err}`, error: true }])
-    }
+    setLoading(true)
+
+    const observable = client.subscribe({
+      query: INFER_STREAM,
+      variables: { prompt: userText, webSearch: didSearch },
+    })
+
+    subRef.current = observable.subscribe({
+      next({ data }) {
+        const { token, done } = data.inferStream
+        if (done) {
+          setLoading(false)
+          subRef.current?.unsubscribe()
+        } else {
+          setMessages(m => {
+            const copy = [...m]
+            const last = copy[copy.length - 1]
+            copy[copy.length - 1] = { ...last, text: last.text + token }
+            return copy
+          })
+        }
+      },
+      error(err) {
+        setMessages(m => {
+          const copy = [...m]
+          copy[copy.length - 1] = { role: 'assistant', text: `Error: ${err}`, error: true }
+          return copy
+        })
+        setLoading(false)
+      },
+    })
   }
 
   return (
@@ -59,9 +95,7 @@ function ChatTab() {
         {messages.map((m, i) => (
           <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: m.role === 'user' ? 'flex-end' : 'flex-start' }}>
             {m.searched && (
-              <span style={{ fontSize: 11, color: '#6b7280', marginBottom: 3, display: 'flex', alignItems: 'center', gap: 3 }}>
-                🌐 web search
-              </span>
+              <span style={{ fontSize: 11, color: '#6b7280', marginBottom: 3 }}>🌐 web search</span>
             )}
             <div style={{
               maxWidth: '70%',
@@ -73,26 +107,29 @@ function ChatTab() {
               lineHeight: 1.55,
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
+              // Blinking cursor while the last assistant message is still streaming
+              borderRight: (!m.error && m.role === 'assistant' && i === messages.length - 1 && loading)
+                ? '2px solid #6b7280' : 'none',
             }}>
-              {m.text}
+              {m.text || (m.role === 'assistant' && loading && i === messages.length - 1 ? '\u00A0' : '')}
             </div>
           </div>
         ))}
 
-        {loading && (
+        {/* "Searching…" indicator before first token arrives */}
+        {loading && messages[messages.length - 1]?.text === '' && (
           <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
             <div style={{ padding: '0.55rem 0.9rem', borderRadius: '16px 16px 16px 4px', background: '#f3f4f6', color: '#6b7280', fontSize: 14 }}>
               {webSearch ? '🌐 searching…' : <span style={{ letterSpacing: 2 }}>•••</span>}
             </div>
           </div>
         )}
+
         <div ref={bottomRef} />
       </div>
 
       {/* Input bar */}
       <div style={{ padding: '0.75rem 1rem', borderTop: '1px solid #e5e7eb', display: 'flex', gap: '0.5rem', alignItems: 'center', background: '#fff' }}>
-
-        {/* Web search toggle */}
         <button
           onClick={() => setWebSearch(s => !s)}
           title={webSearch ? 'Web search on' : 'Web search off'}
@@ -105,7 +142,6 @@ function ChatTab() {
             cursor: 'pointer',
             fontSize: 13,
             fontWeight: 500,
-            whiteSpace: 'nowrap',
             flexShrink: 0,
           }}
         >
@@ -116,7 +152,7 @@ function ChatTab() {
           value={prompt}
           onChange={e => setPrompt(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
-          placeholder={webSearch ? 'Ask anything — I\'ll search the web…' : 'Type a message…'}
+          placeholder={webSearch ? "Ask anything — I'll search the web…" : 'Type a message…'}
           style={{ flex: 1, padding: '0.6rem 1rem', borderRadius: 20, border: '1px solid #d1d5db', fontSize: 14, outline: 'none' }}
         />
 
@@ -168,8 +204,6 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif', height: '100vh', display: 'flex', flexDirection: 'column', background: '#fff' }}>
-
-      {/* Header / tab bar */}
       <div style={{ borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', padding: '0 0.5rem', flexShrink: 0 }}>
         <span style={{ fontWeight: 700, fontSize: 14, padding: '0 0.75rem', color: '#111827' }}>
           Inference Server
@@ -179,7 +213,6 @@ export default function App() {
         {tabBtn('explorer', 'GraphQL Explorer')}
       </div>
 
-      {/* Tab content */}
       {tab === 'chat' && <ChatTab />}
       {tab === 'explorer' && (
         <div style={{ flex: 1, overflow: 'hidden' }}>
